@@ -480,7 +480,7 @@ class MainActivity : Activity(), RemoteClient.Listener {
         appsHolder.removeAllViews()
         val views = mutableListOf<View>()
         apps.forEachIndexed { i, a ->
-            views.add(ui.appTile(a.name, a.color, { editApp(i) }) { link(a.link) })
+            views.add(ui.appTile(a.name, a.color, { editApp(i, null) }) { link(a.link) })
         }
         views.add(ui.addTile("Añadir") { showAddApp() })
         appsHolder.addView(ui.grid(views, 4, 14, center = true))
