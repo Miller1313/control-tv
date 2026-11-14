@@ -27,24 +27,67 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 
+data class Theme(
+    val name: String,
+    val bg: String, val surface: String, val surface2: String, val surface3: String, val stroke: String,
+    val text: String, val muted: String, val accent: String, val accent2: String,
+    val light: Boolean = false
+)
+
+object Themes {
+    val all = listOf(
+        Theme("Medianoche", "#0B0D12", "#14171F", "#1C2029", "#262B36", "#2A2F3A", "#F2F4F8", "#8B93A5", "#7C8CFF", "#B07CFF"),
+        Theme("AMOLED", "#000000", "#0C0C0C", "#161616", "#222222", "#1E1E1E", "#FFFFFF", "#8A8A8A", "#00E5FF", "#2979FF"),
+        Theme("Océano", "#06141B", "#0C2230", "#123042", "#1A4057", "#1A3A4E", "#E6F6FF", "#7FA7BD", "#00B4F0", "#00D6A8"),
+        Theme("Atardecer", "#1A0E14", "#26141D", "#321A26", "#422233", "#3A2030", "#FFF1EC", "#C79AA6", "#FF7A59", "#FF3D7F"),
+        Theme("Bosque", "#0C1410", "#13201A", "#1A2B22", "#24392D", "#22352A", "#EAF5EE", "#8FB09C", "#2FBF71", "#8BC34A"),
+        Theme("Neón", "#0A0618", "#140D2B", "#1D1340", "#2A1B59", "#2A1F4F", "#F5F0FF", "#9A8CC4", "#FF2BD6", "#00D9FF"),
+        Theme("Cine Rojo", "#0F0F0F", "#1A1A1A", "#242424", "#2F2F2F", "#2C2C2C", "#F5F5F5", "#9A9A9A", "#E50914", "#FF6A3D"),
+        Theme("Mocha", "#17120F", "#221B16", "#2D241D", "#3A2F26", "#352B23", "#F6EDE4", "#B3A193", "#C8894F", "#E0B354"),
+        Theme("Claro", "#F3F4F8", "#FFFFFF", "#ECEEF4", "#E0E3EC", "#DADEE8", "#12141A", "#6B7280", "#4F6BFF", "#8B5CF6", true),
+        Theme("Sakura", "#FFF4F6", "#FFFFFF", "#FCE7ED", "#F7D3DE", "#F1CFD9", "#2A1A20", "#8A6A75", "#F0507F", "#FF8A5B", true),
+    )
+}
+
 object Palette {
-    val BG = Color.parseColor("#0B0D12")
-    val SURFACE = Color.parseColor("#14171F")
-    val SURFACE2 = Color.parseColor("#1C2029")
-    val SURFACE3 = Color.parseColor("#262B36")
-    val STROKE = Color.parseColor("#2A2F3A")
-    val TEXT = Color.parseColor("#F2F4F8")
-    val MUTED = Color.parseColor("#8B93A5")
-    val ACCENT = Color.parseColor("#7C8CFF")
-    val ACCENT2 = Color.parseColor("#B07CFF")
+    var BG = Color.parseColor("#0B0D12")
+    var SURFACE = Color.parseColor("#14171F")
+    var SURFACE2 = Color.parseColor("#1C2029")
+    var SURFACE3 = Color.parseColor("#262B36")
+    var STROKE = Color.parseColor("#2A2F3A")
+    var TEXT = Color.parseColor("#F2F4F8")
+    var MUTED = Color.parseColor("#8B93A5")
+    var ACCENT = Color.parseColor("#7C8CFF")
+    var ACCENT2 = Color.parseColor("#B07CFF")
+    var LIGHT = false
     val RED = Color.parseColor("#FF5C67")
-    val GREEN = Color.parseColor("#3DD68C")
-    val YELLOW = Color.parseColor("#F5C451")
+    val GREEN = Color.parseColor("#2FBF71")
+    val YELLOW = Color.parseColor("#E9A800")
+    val BLUE = Color.parseColor("#3E8BFF")
     val CHIPS = intArrayOf(
         Color.parseColor("#7C8CFF"), Color.parseColor("#B07CFF"), Color.parseColor("#12A594"),
         Color.parseColor("#FF5C67"), Color.parseColor("#F76B15"), Color.parseColor("#3E63DD"),
         Color.parseColor("#E5A00D"), Color.parseColor("#1DB954")
     )
+
+    fun apply(t: Theme) {
+        BG = Color.parseColor(t.bg)
+        SURFACE = Color.parseColor(t.surface)
+        SURFACE2 = Color.parseColor(t.surface2)
+        SURFACE3 = Color.parseColor(t.surface3)
+        STROKE = Color.parseColor(t.stroke)
+        TEXT = Color.parseColor(t.text)
+        MUTED = Color.parseColor(t.muted)
+        ACCENT = Color.parseColor(t.accent)
+        ACCENT2 = Color.parseColor(t.accent2)
+        LIGHT = t.light
+    }
+
+    /** Readable text colour on top of [bg]. */
+    fun on(bg: Int): Int {
+        val l = (0.299 * Color.red(bg) + 0.587 * Color.green(bg) + 0.114 * Color.blue(bg)) / 255.0
+        return if (l > 0.62) Color.parseColor("#14161C") else Color.parseColor("#F7F8FB")
+    }
 }
 
 class Ui(private val act: Activity) {
@@ -58,13 +101,13 @@ class Ui(private val act: Activity) {
     fun rounded(color: Int, radiusDp: Int = 16, stroke: Int? = null): GradientDrawable =
         GradientDrawable().apply {
             setColor(color)
-            cornerRadius = dp(radiusDp).toFloat()
+            cornerRadius = r(radiusDp)
             if (stroke != null) setStroke(dp(1), stroke)
         }
 
     fun gradient(a: Int, b: Int, radiusDp: Int): GradientDrawable =
         GradientDrawable(GradientDrawable.Orientation.TL_BR, intArrayOf(a, b)).apply {
-            cornerRadius = dp(radiusDp).toFloat()
+            cornerRadius = r(radiusDp)
         }
 
     fun oval(color: Int, stroke: Int? = null): GradientDrawable = GradientDrawable().apply {
@@ -74,7 +117,7 @@ class Ui(private val act: Activity) {
     }
 
     fun ripple(base: GradientDrawable) =
-        RippleDrawable(ColorStateList.valueOf(Color.argb(50, 255, 255, 255)), base, null)
+        RippleDrawable(ColorStateList.valueOf(if (Palette.LIGHT) Color.argb(40, 0, 0, 0) else Color.argb(50, 255, 255, 255)), base, null)
 
     fun vertical(paddingDp: Int = 0): LinearLayout = LinearLayout(act).apply {
         orientation = LinearLayout.VERTICAL
@@ -86,13 +129,22 @@ class Ui(private val act: Activity) {
         gravity = Gravity.CENTER_VERTICAL
     }
 
+    /** Font family of the current design (e.g. monospace for Retro). */
+    var family: String = "sans-serif"
+
     fun text(s: String, sizeSp: Float = 14f, color: Int = Palette.TEXT, bold: Boolean = false) =
         TextView(act).apply {
             text = s
             setTextColor(color)
             textSize = sizeSp
-            if (bold) typeface = medium
+            typeface = Typeface.create(if (bold && family == "sans-serif") "sans-serif-medium" else family,
+                if (bold && family != "sans-serif") Typeface.BOLD else Typeface.NORMAL)
         }
+
+    /** Corner radius multiplier of the current design (0 = square keys, 1 = normal). */
+    var roundness: Float = 1f
+
+    private fun r(radiusDp: Int): Float = dp(radiusDp) * roundness
 
     fun title(s: String): TextView = text(s, 13f, Palette.MUTED, true).apply {
         letterSpacing = 0.04f
@@ -166,7 +218,7 @@ class Ui(private val act: Activity) {
         res: Int,
         sizeDp: Int = 56,
         bg: Int = Palette.SURFACE2,
-        tint: Int = Palette.TEXT,
+        tint: Int = Palette.on(bg),
         iconDp: Int = 24,
         circle: Boolean = true,
         repeat: Boolean = false,
@@ -188,7 +240,7 @@ class Ui(private val act: Activity) {
     fun button(
         label: String,
         bg: Int = Palette.SURFACE2,
-        textColor: Int = Palette.TEXT,
+        textColor: Int = Palette.on(bg),
         heightDp: Int = 50,
         sizeSp: Float = 14f,
         iconRes: Int? = null,
@@ -248,7 +300,7 @@ class Ui(private val act: Activity) {
         return col
     }
 
-    fun chip(label: String, color: Int = Palette.SURFACE2, textColor: Int = Palette.TEXT,
+    fun chip(label: String, color: Int = Palette.SURFACE2, textColor: Int = Palette.on(color),
              onLongPress: (() -> Unit)? = null, onTap: () -> Unit): TextView =
         text(label, 13f, textColor, true).apply {
             background = ripple(rounded(color, 40))

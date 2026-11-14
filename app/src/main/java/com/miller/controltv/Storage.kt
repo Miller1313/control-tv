@@ -15,10 +15,17 @@ enum class ActionType(val label: String, val hint: String) {
 data class CustomButton(val label: String, val type: ActionType, val value: String, val color: Int)
 
 /** A tile on the Apps page. [link] is a deep link or market://launch?id=<package>. */
-data class AppShortcut(val name: String, val link: String, val color: Int)
+data class AppShortcut(
+    val name: String,
+    val link: String,
+    val color: Int,
+    /** Recorded key presses from the Home screen, for apps that cannot be opened by link. */
+    val route: List<Int> = emptyList()
+)
 
 object AppCatalog {
     fun pkg(p: String) = "market://launch?id=$p"
+    const val PLAY_STORE = "https://play.google.com/store/apps"
 
     val apps: List<AppShortcut> = listOf(
         AppShortcut("YouTube", "https://www.youtube.com", 0xFFFF0033.toInt()),
@@ -37,7 +44,7 @@ object AppCatalog {
         AppShortcut("Pluto TV", pkg("tv.pluto.android"), 0xFF8A7A00.toInt()),
         AppShortcut("Tubi", pkg("com.tubitv"), 0xFF7408FF.toInt()),
         AppShortcut("Kodi", pkg("org.xbmc.kodi"), 0xFF17B2E7.toInt()),
-        AppShortcut("Play Store", pkg("com.android.vending"), 0xFF01875F.toInt()),
+        AppShortcut("Play Store", PLAY_STORE, 0xFF01875F.toInt()),
     )
 }
 
@@ -62,6 +69,18 @@ class Storage(context: Context) {
     var touchpad: Boolean
         get() = prefs.getBoolean("touchpad", false)
         set(v) { prefs.edit().putBoolean("touchpad", v).apply() }
+
+    var theme: Int
+        get() = prefs.getInt("theme", 0).coerceIn(0, Themes.all.size - 1)
+        set(v) { prefs.edit().putInt("theme", v).apply() }
+
+    var design: Int
+        get() = prefs.getInt("design", 0).coerceIn(0, Designs.all.size - 1)
+        set(v) { prefs.edit().putInt("design", v).apply() }
+
+    var autoKeyboard: Boolean
+        get() = prefs.getBoolean("autoKeyboard", true)
+        set(v) { prefs.edit().putBoolean("autoKeyboard", v).apply() }
 
     var phoneVolumeKeys: Boolean
         get() = prefs.getBoolean("phoneVolume", true)
@@ -109,7 +128,12 @@ class Storage(context: Context) {
             val arr = JSONArray(raw)
             MutableList(arr.length()) { i ->
                 val o = arr.getJSONObject(i)
-                AppShortcut(o.getString("name"), o.getString("link"), o.optInt("color", Palette.CHIPS[0]))
+                var link = o.getString("link")
+                // Older versions opened the Play Store in a way that most TVs reject.
+                if (link == AppCatalog.pkg("com.android.vending")) link = AppCatalog.PLAY_STORE
+                val r = o.optJSONArray("route")
+                val route = if (r == null) emptyList() else List(r.length()) { r.getInt(it) }
+                AppShortcut(o.getString("name"), link, o.optInt("color", Palette.CHIPS[0]), route)
             }
         } catch (_: Exception) {
             AppCatalog.apps.take(5).toMutableList()
@@ -118,7 +142,11 @@ class Storage(context: Context) {
 
     fun saveApps(list: List<AppShortcut>) {
         val arr = JSONArray()
-        list.forEach { arr.put(JSONObject().put("name", it.name).put("link", it.link).put("color", it.color)) }
+        list.forEach {
+            val r = JSONArray()
+            it.route.forEach { k -> r.put(k) }
+            arr.put(JSONObject().put("name", it.name).put("link", it.link).put("color", it.color).put("route", r))
+        }
         prefs.edit().putString("apps", arr.toString()).apply()
     }
 
@@ -146,4 +174,17 @@ class Storage(context: Context) {
     fun clearHistory() {
         prefs.edit().remove("history").apply()
     }
+}
+
+/** The five control layouts the user can pick. */
+data class Design(val name: String, val description: String)
+
+object Designs {
+    val all = listOf(
+        Design("Órbita", "D-pad circular, volumen y canales en cápsulas"),
+        Design("Zen", "Un gran touchpad: todo con gestos, casi sin botones"),
+        Design("Retro", "Como un control físico clásico, teclas cuadradas"),
+        Design("Gamepad", "Estilo mando de consola: cruceta y botones A B X Y"),
+        Design("Una mano", "Todo abajo, al alcance del pulgar"),
+    )
 }

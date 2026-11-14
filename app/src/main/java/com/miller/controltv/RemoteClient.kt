@@ -1,14 +1,16 @@
 package com.miller.controltv
 
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import javax.net.ssl.SSLHandshakeException
 import javax.net.ssl.SSLSocket
 
 /**
  * Remote control session over port 6466 (Android TV Remote v2).
- * All network work happens on background threads; callbacks are invoked on
- * those threads, so the UI must post them to the main thread.
+ * Callbacks run on background threads; the UI must post them to the main thread.
  */
 class RemoteClient(
     private val tls: Tls,
@@ -21,24 +23,37 @@ class RemoteClient(
         fun onDisconnected(error: String?, needsPairing: Boolean)
         fun onVolume(level: Int, max: Int, muted: Boolean)
         fun onCurrentApp(packageName: String) {}
+        /** A text field got focus on the TV (its keyboard opened). */
+        fun onTextField(value: String, label: String) {}
+        fun onRemoteError() {}
     }
 
     companion object {
-        // Feature mask used by the official remote: ping, key, IME, power, volume, app link
-        private const val FEATURES = 622
+        // PING | KEY | IME | VOICE | POWER | VOLUME | APP_LINK
+        private const val FEATURES = 1 or 2 or 4 or 8 or 32 or 64 or 512
         const val SHORT = 3
         const val START_LONG = 1
         const val END_LONG = 2
+        const val VOICE_CHUNK = 8 * 1024
     }
 
     private val sender = Executors.newSingleThreadExecutor()
+    private val main = Handler(Looper.getMainLooper())
     @Volatile private var socket: SSLSocket? = null
     @Volatile private var running = false
     @Volatile var ready = false
         private set
     @Volatile private var gotMessage = false
-    @Volatile private var imeCounter = -1
-    @Volatile private var fieldCounter = -1
+    @Volatile private var active = FEATURES
+
+    // IME (keyboard) state, as reported by the TV
+    @Volatile private var imeCounter = 0
+    @Volatile private var fieldCounter = 0
+    @Volatile private var hasImeCounter = false
+    @Volatile private var hasFieldCounter = false
+
+    // Voice
+    @Volatile private var voiceWaiter: ((Int?) -> Unit)? = null
 
     fun connect() {
         running = true
@@ -77,14 +92,24 @@ class RemoteClient(
             ready = false
             try { socket?.close() } catch (_: Exception) {}
             socket = null
+            voiceWaiter?.let { w -> voiceWaiter = null; w(null) }
             if (wasRunning) listener.onDisconnected(error, needsPairing)
+        }
+    }
+
+    private fun markReady() {
+        if (!ready) {
+            ready = true
+            listener.onReady()
         }
     }
 
     private fun handle(msg: ProtoMessage) {
         when {
             msg.has(1) -> {
-                // RemoteConfigure: answer with our features and device info
+                // RemoteConfigure: keep only the features the TV supports
+                val tvFeatures = msg.message(1)?.int(1) ?: 0
+                active = if (tvFeatures != 0) FEATURES and tvFeatures else FEATURES
                 val info = ProtoWriter()
                     .string(1, Build.MODEL ?: "Android")
                     .string(2, Build.MANUFACTURER ?: "Android")
@@ -92,42 +117,61 @@ class RemoteClient(
                     .string(4, "1")
                     .string(5, "atvremote")
                     .string(6, "1.0.0")
-                send(ProtoWriter().message(1, ProtoWriter().varint(1, FEATURES).message(2, info)))
+                send(ProtoWriter().message(1, ProtoWriter().varint(1, active).message(2, info)))
             }
             msg.has(2) -> {
-                // RemoteSetActive
-                send(ProtoWriter().message(2, ProtoWriter().varint(1, FEATURES)))
+                send(ProtoWriter().message(2, ProtoWriter().varint(1, active)))
+                // Some TVs never send RemoteStart; the session works after set-active.
+                markReady()
             }
+            msg.has(3) -> listener.onRemoteError()
             msg.has(8) -> {
-                // Ping -> pong with the same value
                 val v = msg.message(8)?.int(1) ?: 0
                 send(ProtoWriter().message(9, ProtoWriter().varint(1, v)))
             }
-            msg.has(40) -> {
-                if (!ready) {
-                    ready = true
-                    listener.onReady()
-                }
-            }
+            msg.has(40) -> markReady()
             msg.has(50) -> {
                 val v = msg.message(50) ?: return
                 listener.onVolume(v.int(7), v.int(6), v.long(8) != 0L)
             }
             msg.has(20) -> {
-                // IME key inject: carries the app in the foreground
-                val pkg = msg.message(20)?.message(1)?.string(12)
+                // RemoteImeKeyInject: app_info(1){counter=1, app_package=12}, text_field_status(2){counter_field=1}
+                val inject = msg.message(20) ?: return
+                val app = inject.message(1)
+                val field = inject.message(2)
+                val counter = app?.int(1) ?: 0
+                val fc = field?.int(1) ?: 0
+                imeCounter = counter
+                fieldCounter = fc
+                hasImeCounter = counter != 0
+                hasFieldCounter = fc != 0
+                val pkg = app?.string(12)
                 if (!pkg.isNullOrEmpty()) listener.onCurrentApp(pkg)
+            }
+            msg.has(22) -> {
+                // RemoteImeShowRequest: remote_text_field_status(2){counter_field=1, value=2, label=6}
+                val status = msg.message(22)?.message(2)
+                if (status != null) {
+                    fieldCounter = status.int(1)
+                    hasFieldCounter = true
+                    listener.onTextField(status.string(2) ?: "", status.string(6) ?: "")
+                }
             }
             msg.has(21) -> {
                 val b = msg.message(21) ?: return
-                imeCounter = b.int(1)
-                fieldCounter = b.int(2)
+                if (!hasImeCounter) imeCounter = b.int(1)
+                if (!hasFieldCounter) fieldCounter = b.int(2)
             }
-        }
-        // Some TVs never send RemoteStart; consider the session ready after set-active.
-        if (!ready && msg.has(2)) {
-            ready = true
-            listener.onReady()
+            msg.has(30) -> {
+                // RemoteVoiceBegin from the TV: the voice session is ready
+                val id = msg.message(30)?.int(1) ?: 0
+                val w = voiceWaiter
+                if (w != null) {
+                    voiceWaiter = null
+                    send(ProtoWriter().message(30, ProtoWriter().varint(1, id)))
+                    w(id)
+                }
+            }
         }
     }
 
@@ -135,13 +179,16 @@ class RemoteClient(
         val s = socket ?: return
         if (sender.isShutdown) return
         val bytes = w.toByteArray()
-        try { sender.execute {
-            try {
-                Framing.write(s.outputStream, bytes)
-            } catch (_: Exception) {
-                // read loop will notice the broken connection
+        try {
+            sender.execute {
+                try {
+                    Framing.write(s.outputStream, bytes)
+                } catch (_: Exception) {
+                    // the read loop notices a broken connection
+                }
             }
-        } } catch (_: java.util.concurrent.RejectedExecutionException) {}
+        } catch (_: RejectedExecutionException) {
+        }
     }
 
     fun key(code: Int, direction: Int = SHORT) {
@@ -152,36 +199,48 @@ class RemoteClient(
         send(ProtoWriter().message(90, ProtoWriter().string(1, link)))
     }
 
-    /**
-     * Types text into the focused field on the TV. Uses the IME channel when the
-     * TV has told us its counters; otherwise falls back to individual key presses.
-     */
+    /** Writes [text] into the focused text field on the TV, through the TV keyboard. */
     fun text(text: String) {
         if (text.isEmpty()) return
-        if (imeCounter >= 0 && fieldCounter >= 0) {
-            val obj = ProtoWriter()
-                .varint(1, text.length - 1)
-                .varint(2, text.length - 1)
-                .string(3, text)
-            val edit = ProtoWriter().varint(1, 1).message(2, obj)
-            send(
-                ProtoWriter().message(
-                    21,
-                    ProtoWriter().varint(1, imeCounter).varint(2, fieldCounter).message(3, edit)
-                )
+        val obj = ProtoWriter()
+            .varint(1, text.length)
+            .varint(2, text.length)
+            .string(3, text)
+        val edit = ProtoWriter().varint(1, 1).message(2, obj)
+        send(
+            ProtoWriter().message(
+                21,
+                ProtoWriter().varint(1, imeCounter).varint(2, fieldCounter).message(3, edit)
             )
-        } else {
-            for (c in text) {
-                val k = KeyCodes.forChar(c) ?: continue
-                if (k.second) {
-                    key(KeyCodes.SHIFT_LEFT, START_LONG)
-                    key(k.first)
-                    key(KeyCodes.SHIFT_LEFT, END_LONG)
-                } else {
-                    key(k.first)
-                }
+        )
+    }
+
+    val supportsVoice: Boolean get() = (active and 8) != 0
+
+    /**
+     * Starts a voice session (like holding the mic button on the TV remote).
+     * [onReady] gets the session id, or null if the TV does not answer.
+     */
+    fun startVoice(onReady: (Int?) -> Unit) {
+        voiceWaiter = onReady
+        key(KeyCodes.SEARCH)
+        main.postDelayed({
+            val w = voiceWaiter
+            if (w === onReady) {
+                voiceWaiter = null
+                w(null)
             }
-        }
+        }, 2500)
+    }
+
+    /** 16-bit PCM, mono, 8 kHz. Chunks must be at least 8 KB. */
+    fun sendVoice(session: Int, pcm: ByteArray) {
+        val data = if (pcm.size < VOICE_CHUNK) pcm.copyOf(VOICE_CHUNK) else pcm
+        send(ProtoWriter().message(31, ProtoWriter().varint(1, session).bytes(2, data)))
+    }
+
+    fun endVoice(session: Int) {
+        send(ProtoWriter().message(32, ProtoWriter().varint(1, session)))
     }
 
     fun close() {

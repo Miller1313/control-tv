@@ -1,16 +1,23 @@
 package com.miller.controltv
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.Dialog
+import android.content.ActivityNotFoundException
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.text.Editable
+import android.speech.RecognizerIntent
 import android.text.InputType
-import android.text.TextWatcher
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
 import android.view.KeyEvent
@@ -31,8 +38,10 @@ import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import java.net.URLEncoder
+import java.util.Locale
 import java.util.concurrent.Executors
 import kotlin.math.abs
+import kotlin.math.max
 
 class MainActivity : Activity(), RemoteClient.Listener {
 
@@ -46,20 +55,25 @@ class MainActivity : Activity(), RemoteClient.Listener {
     private var device: TvDevice? = null
     private var autoRetry = true
     private var currentApp: String? = null
+    private var resumed = false
+    private var design = 0
 
     private lateinit var statusDot: View
     private lateinit var statusText: TextView
     private lateinit var tvName: TextView
     private lateinit var volumeLabel: TextView
-    private lateinit var navHolder: FrameLayout
-    private lateinit var navToggle: FrameLayout
+    private var navHolder: FrameLayout? = null
+    private var navToggle: FrameLayout? = null
     private lateinit var appsHolder: LinearLayout
-    private lateinit var nowPlayingCard: LinearLayout
     private lateinit var nowPlayingText: TextView
     private lateinit var nowPlayingButton: View
     private lateinit var historyHolder: LinearLayout
     private lateinit var shortcutsHolder: LinearLayout
     private lateinit var searchField: EditText
+    private lateinit var voiceBubble: LinearLayout
+    private lateinit var voiceBubbleText: TextView
+    private lateinit var routeBanner: LinearLayout
+    private lateinit var routeBannerText: TextView
 
     private val pages = mutableListOf<View>()
     private val tabs = mutableListOf<LinearLayout>()
@@ -67,12 +81,40 @@ class MainActivity : Activity(), RemoteClient.Listener {
     private lateinit var buttons: MutableList<CustomButton>
     private lateinit var apps: MutableList<AppShortcut>
 
+    // keyboard
+    private var keyboardSheet: Dialog? = null
+    private var tvFieldText = ""
+    private var tvFieldLabel = ""
+    private var lastAutoKeyboard = 0L
+
+    // voice
+    @Volatile private var voiceRecording = false
+    private var voicePressed = false
+    private var voiceSession: Int? = null
+
+    // app launching
+    private var lastLinkAt = 0L
+    private var recordingRoute: MutableList<Int>? = null
+    private var routeTarget = -1
+
+    companion object {
+        private const val REQ_SPEECH = 42
+        private const val REQ_MIC = 7
+    }
+
     // ================================================================ lifecycle
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        ui = Ui(this)
         storage = Storage(this)
+        Palette.apply(Themes.all[storage.theme])
+        design = storage.design
+        ui = Ui(this)
+        if (design == 2) {
+            ui.family = "monospace"
+            ui.roundness = 0.3f
+        }
+        applyWindowColors()
         tls = Tls(this)
         buttons = storage.loadButtons()
         apps = storage.loadApps()
@@ -85,16 +127,36 @@ class MainActivity : Activity(), RemoteClient.Listener {
         if (last != null) connectTo(last) else main.postDelayed({ showDevicePicker() }, 300)
     }
 
+    @Suppress("DEPRECATION")
+    private fun applyWindowColors() {
+        window.statusBarColor = Palette.BG
+        window.navigationBarColor = Palette.BG
+        var flags = window.decorView.systemUiVisibility
+        flags = if (Palette.LIGHT) {
+            flags or View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+        } else {
+            flags and View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR.inv() and View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR.inv()
+        }
+        window.decorView.systemUiVisibility = flags
+    }
+
     override fun onDestroy() {
         super.onDestroy()
+        voiceRecording = false
         client?.close()
         worker.shutdown()
     }
 
     override fun onResume() {
         super.onResume()
+        resumed = true
         val d = device
         if (d != null && client == null) connectTo(d)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        resumed = false
     }
 
     /** The phone's own volume buttons control the TV while connected. */
@@ -116,11 +178,25 @@ class MainActivity : Activity(), RemoteClient.Listener {
         return super.onKeyUp(keyCode, event)
     }
 
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        @Suppress("DEPRECATION")
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQ_SPEECH && resultCode == RESULT_OK) {
+            val q = data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull() ?: return
+            searchField.setText(q)
+            selectTab(2)
+            youtubeSearch(q)
+        }
+    }
+
     // ================================================================ layout
 
     private fun buildLayout(): View {
+        val frame = FrameLayout(this)
+        frame.setBackgroundColor(Palette.BG)
+
         val root = ui.vertical()
-        root.setBackgroundColor(Palette.BG)
         root.addView(header())
 
         val content = FrameLayout(this)
@@ -128,13 +204,60 @@ class MainActivity : Activity(), RemoteClient.Listener {
         listOf(controlPage(), appsPage(), searchPage()).forEach { page ->
             val scroll = ScrollView(this)
             scroll.isVerticalScrollBarEnabled = false
+            scroll.isFillViewport = true
             scroll.addView(page)
             pages.add(scroll)
             content.addView(scroll)
         }
         root.addView(content)
         root.addView(bottomNav())
-        return root
+        frame.addView(root)
+
+        // Voice bubble (shown while the phone is the TV's microphone)
+        voiceBubble = ui.horizontal()
+        voiceBubble.gravity = Gravity.CENTER
+        voiceBubble.background = ui.gradient(Palette.ACCENT, Palette.ACCENT2, 40)
+        voiceBubble.setPadding(ui.dp(22), ui.dp(14), ui.dp(22), ui.dp(14))
+        val mic = ui.icon(R.drawable.ic_mic, Color.WHITE, 22)
+        mic.layoutParams = LinearLayout.LayoutParams(ui.dp(22), ui.dp(22)).apply { rightMargin = ui.dp(10) }
+        voiceBubble.addView(mic)
+        voiceBubbleText = ui.text("Escuchando…", 15f, Color.WHITE, true)
+        voiceBubble.addView(voiceBubbleText)
+        voiceBubble.layoutParams = FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+        ).apply { bottomMargin = ui.dp(96) }
+        voiceBubble.elevation = ui.dp(8).toFloat()
+        voiceBubble.visibility = View.GONE
+        frame.addView(voiceBubble)
+
+        // Route recording banner
+        routeBanner = ui.vertical(16)
+        routeBanner.background = ui.rounded(Palette.SURFACE2, 22, Palette.ACCENT)
+        routeBanner.elevation = ui.dp(8).toFloat()
+        val bannerTitle = ui.horizontal()
+        val dot = ui.icon(R.drawable.ic_record, Palette.RED, 14)
+        dot.layoutParams = LinearLayout.LayoutParams(ui.dp(14), ui.dp(14)).apply { rightMargin = ui.dp(8) }
+        bannerTitle.addView(dot)
+        bannerTitle.addView(ui.text("Grabando ruta", 15f, Palette.TEXT, true))
+        routeBanner.addView(bannerTitle)
+        routeBannerText = ui.text("", 13f, Palette.MUTED)
+        routeBannerText.setPadding(0, ui.dp(6), 0, ui.dp(12))
+        routeBanner.addView(routeBannerText)
+        routeBanner.addView(
+            ui.grid(
+                listOf(
+                    ui.button("Cancelar", Palette.SURFACE3, heightDp = 44) { finishRoute(false) },
+                    ui.button("Listo", Palette.ACCENT, heightDp = 44) { finishRoute(true) },
+                ), 2
+            )
+        )
+        routeBanner.layoutParams = FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP
+        ).apply { setMargins(ui.dp(14), ui.dp(80), ui.dp(14), 0) }
+        routeBanner.visibility = View.GONE
+        frame.addView(routeBanner)
+        return frame
     }
 
     private fun header(): View {
@@ -162,18 +285,33 @@ class MainActivity : Activity(), RemoteClient.Listener {
         statusText.maxLines = 1
         statusRow.addView(statusDot)
         statusRow.addView(statusText)
-        statusRow.setOnClickListener { device?.let { connectTo(it) } ?: showDevicePicker() }
+        statusRow.setOnClickListener {
+            val d = device
+            if (d != null) connectTo(d) else showDevicePicker()
+        }
         texts.addView(nameRow)
         texts.addView(statusRow)
         row.addView(texts)
 
-        row.addView(ui.iconButton(R.drawable.ic_input, 46, Palette.SURFACE2, iconDp = 22) { showInputs() })
-        val gap = View(this)
-        gap.layoutParams = LinearLayout.LayoutParams(ui.dp(10), 1)
-        row.addView(gap)
+        row.addView(ui.iconButton(R.drawable.ic_palette, 44, Palette.SURFACE2, iconDp = 21) { showPersonalize() })
+        row.addView(hGap(8))
+        row.addView(ui.iconButton(R.drawable.ic_input, 44, Palette.SURFACE2, iconDp = 21) { showInputs() })
+        row.addView(hGap(8))
         val powerBg = (Palette.RED and 0x00FFFFFF) or 0x2E000000
-        row.addView(ui.iconButton(R.drawable.ic_power, 46, powerBg, Palette.RED, 22) { key(KeyCodes.POWER) })
+        row.addView(ui.iconButton(R.drawable.ic_power, 44, powerBg, Palette.RED, 21) { key(KeyCodes.POWER) })
         return row
+    }
+
+    private fun hGap(dp: Int): View {
+        val v = View(this)
+        v.layoutParams = LinearLayout.LayoutParams(ui.dp(dp), 1)
+        return v
+    }
+
+    private fun flexGap(): View {
+        val v = View(this)
+        v.layoutParams = LinearLayout.LayoutParams(0, 1, 1f)
+        return v
     }
 
     private fun bottomNav(): View {
@@ -209,41 +347,62 @@ class MainActivity : Activity(), RemoteClient.Listener {
         tabs.forEachIndexed { i, t ->
             val on = i == index
             t.background = if (on) ui.gradient(Palette.ACCENT, Palette.ACCENT2, 20) else null
-            val color = if (on) Color.WHITE else Palette.MUTED
+            val color = if (on) Palette.on(Palette.ACCENT) else Palette.MUTED
             (t.getChildAt(0) as ImageView).imageTintList = ColorStateList.valueOf(color)
             (t.getChildAt(1) as TextView).setTextColor(color)
         }
         if (index == 1) renderNowPlaying()
     }
 
-    // ---------------------------------------------------------------- control page
+    // ================================================================ control page (5 designs)
 
     private fun controlPage(): View {
+        volumeLabel = ui.text("VOL", 12f, Palette.MUTED, true)
+        return when (design) {
+            1 -> zenPage()
+            2 -> retroPage()
+            3 -> gamepadPage()
+            4 -> oneHandPage()
+            else -> orbitPage()
+        }
+    }
+
+    private fun pageBox(): LinearLayout {
         val page = ui.vertical()
         page.setPadding(ui.dp(20), ui.dp(8), ui.dp(20), ui.dp(16))
+        return page
+    }
 
-        navToggle = ui.iconButton(if (storage.touchpad) R.drawable.ic_dpad else R.drawable.ic_touch, 54) {
+    private fun navToggleButton(size: Int): FrameLayout {
+        val b = ui.iconButton(if (storage.touchpad) R.drawable.ic_dpad else R.drawable.ic_touch, size) {
             toggleTouchpad()
         }
+        navToggle = b
+        return b
+    }
+
+    // ---- Design 0: Órbita
+    private fun orbitPage(): View {
+        val page = pageBox()
         page.addView(
             ui.grid(
                 listOf(
-                    ui.iconButton(R.drawable.ic_back, 54) { key(KeyCodes.BACK) },
-                    ui.iconButton(R.drawable.ic_home, 54) { key(KeyCodes.HOME) },
-                    navToggle,
-                    ui.iconButton(R.drawable.ic_more, 54) { showMore() },
-                ), 4, 10, center = true
+                    ui.iconButton(R.drawable.ic_back, 52) { key(KeyCodes.BACK) },
+                    ui.iconButton(R.drawable.ic_home, 52) { key(KeyCodes.HOME) },
+                    micButton(52, Palette.ACCENT),
+                    navToggleButton(52),
+                    ui.iconButton(R.drawable.ic_more, 52) { showMore() },
+                ), 5, 6, center = true
             )
         )
-
         page.addView(ui.space(18))
-        navHolder = FrameLayout(this)
-        navHolder.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ui.dp(270))
-        page.addView(navHolder)
+        val holder = FrameLayout(this)
+        holder.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ui.dp(270))
+        navHolder = holder
+        page.addView(holder)
         renderNav()
 
         page.addView(ui.space(18))
-        volumeLabel = ui.text("VOL", 12f, Palette.MUTED, true)
         page.addView(
             ui.grid(
                 listOf(
@@ -252,23 +411,8 @@ class MainActivity : Activity(), RemoteClient.Listener {
                 ), 2, 12
             )
         )
-
         page.addView(ui.space(16))
-        val media = ui.horizontal()
-        media.gravity = Gravity.CENTER
-        media.background = ui.rounded(Palette.SURFACE, 30)
-        media.setPadding(ui.dp(8), ui.dp(8), ui.dp(8), ui.dp(8))
-        media.addView(ui.iconButton(R.drawable.ic_prev, 46, Palette.SURFACE) { key(KeyCodes.PREVIOUS) })
-        media.addView(flexGap())
-        media.addView(ui.iconButton(R.drawable.ic_rew, 46, Palette.SURFACE, repeat = true) { key(KeyCodes.REWIND) })
-        media.addView(flexGap())
-        media.addView(ui.iconButton(R.drawable.ic_play_pause, 58, Palette.TEXT, Palette.BG, 26) { key(KeyCodes.PLAY_PAUSE) })
-        media.addView(flexGap())
-        media.addView(ui.iconButton(R.drawable.ic_ff, 46, Palette.SURFACE, repeat = true) { key(KeyCodes.FAST_FORWARD) })
-        media.addView(flexGap())
-        media.addView(ui.iconButton(R.drawable.ic_next, 46, Palette.SURFACE) { key(KeyCodes.NEXT) })
-        page.addView(media)
-
+        page.addView(mediaRow())
         page.addView(ui.space(12))
         page.addView(
             ui.grid(
@@ -281,10 +425,268 @@ class MainActivity : Activity(), RemoteClient.Listener {
         return page
     }
 
-    private fun flexGap(): View {
-        val v = View(this)
-        v.layoutParams = LinearLayout.LayoutParams(0, 1, 1f)
-        return v
+    // ---- Design 1: Zen (gesture-first)
+    private fun zenPage(): View {
+        val page = pageBox()
+        page.addView(
+            ui.grid(
+                listOf(
+                    ui.iconButton(R.drawable.ic_back, 52, Palette.SURFACE) { key(KeyCodes.BACK) },
+                    ui.iconButton(R.drawable.ic_home, 52, Palette.SURFACE) { key(KeyCodes.HOME) },
+                    micButton(52, Palette.ACCENT),
+                    ui.iconButton(R.drawable.ic_keyboard, 52, Palette.SURFACE) { showKeyboard() },
+                    ui.iconButton(R.drawable.ic_more, 52, Palette.SURFACE) { showMore() },
+                ), 5, 6, center = true
+            )
+        )
+        page.addView(ui.space(16))
+        val pad = touchpad()
+        val padHolder = FrameLayout(this)
+        padHolder.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+        padHolder.minimumHeight = ui.dp(320)
+        pad.layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        padHolder.addView(pad)
+        page.addView(padHolder)
+        page.addView(ui.space(14))
+        val row = ui.horizontal()
+        row.gravity = Gravity.CENTER
+        row.addView(ui.button("−", Palette.SURFACE, heightDp = 52, sizeSp = 22f, repeat = true) { key(KeyCodes.VOLUME_DOWN) }
+            .also { it.layoutParams = LinearLayout.LayoutParams(0, ui.dp(52), 1f) })
+        row.addView(hGap(8))
+        row.addView(ui.iconButton(R.drawable.ic_mute, 52, Palette.SURFACE) { key(KeyCodes.MUTE) })
+        row.addView(hGap(8))
+        row.addView(ui.iconButton(R.drawable.ic_play_pause, 52, Palette.TEXT, Palette.BG) { key(KeyCodes.PLAY_PAUSE) })
+        row.addView(hGap(8))
+        row.addView(ui.button("+", Palette.SURFACE, heightDp = 52, sizeSp = 22f, repeat = true) { key(KeyCodes.VOLUME_UP) }
+            .also { it.layoutParams = LinearLayout.LayoutParams(0, ui.dp(52), 1f) })
+        page.addView(row)
+        return page
+    }
+
+    // ---- Design 2: Retro (physical remote)
+    private fun retroPage(): View {
+        val page = pageBox()
+        page.gravity = Gravity.CENTER_HORIZONTAL
+        val body = ui.vertical(18)
+        body.background = ui.gradient(Palette.SURFACE2, Palette.SURFACE, 40).apply {
+            setStroke(ui.dp(1), Palette.STROKE)
+        }
+        body.layoutParams = LinearLayout.LayoutParams(ui.dp(312), ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            gravity = Gravity.CENTER_HORIZONTAL
+        }
+        fun rk(label: String, bg: Int = Palette.SURFACE3, repeat: Boolean = false, tap: () -> Unit) =
+            ui.button(label, bg, heightDp = 42, sizeSp = 12f, repeat = repeat, onTap = tap)
+
+        body.addView(ui.grid(listOf(
+            rk("ATRÁS") { key(KeyCodes.BACK) },
+            rk("INICIO") { key(KeyCodes.HOME) },
+            rk("MENÚ") { key(KeyCodes.MENU) },
+        ), 3, 8))
+        body.addView(ui.space(16))
+        body.addView(centered(crossPad(62, circle = false)))
+        body.addView(ui.space(16))
+
+        fun rocker(label: TextView, up: Int, down: Int): View {
+            val c = ui.vertical()
+            c.gravity = Gravity.CENTER_HORIZONTAL
+            c.background = ui.rounded(Palette.SURFACE3, 20)
+            c.setPadding(ui.dp(4), ui.dp(4), ui.dp(4), ui.dp(4))
+            c.addView(ui.button("+", Palette.SURFACE3, heightDp = 46, sizeSp = 20f, repeat = true) { key(up) })
+            label.gravity = Gravity.CENTER
+            label.setPadding(0, ui.dp(4), 0, ui.dp(4))
+            c.addView(label)
+            c.addView(ui.button("−", Palette.SURFACE3, heightDp = 46, sizeSp = 20f, repeat = true) { key(down) })
+            return c
+        }
+        val middle = ui.vertical()
+        middle.gravity = Gravity.CENTER
+        middle.addView(centered(micButton(54, Palette.ACCENT)))
+        middle.addView(ui.space(10))
+        middle.addView(centered(ui.iconButton(R.drawable.ic_mute, 46, Palette.SURFACE3, circle = false) { key(KeyCodes.MUTE) }))
+        body.addView(ui.grid(listOf(
+            rocker(volumeLabel, KeyCodes.VOLUME_UP, KeyCodes.VOLUME_DOWN),
+            middle,
+            rocker(ui.text("CH", 12f, Palette.MUTED, true), KeyCodes.CHANNEL_UP, KeyCodes.CHANNEL_DOWN),
+        ), 3, 10))
+        body.addView(ui.space(16))
+        body.addView(ui.grid(listOf(
+            ui.iconButton(R.drawable.ic_rew, 44, Palette.SURFACE3, circle = false, repeat = true) { key(KeyCodes.REWIND) },
+            ui.iconButton(R.drawable.ic_play_pause, 44, Palette.ACCENT, circle = false) { key(KeyCodes.PLAY_PAUSE) },
+            ui.iconButton(R.drawable.ic_ff, 44, Palette.SURFACE3, circle = false, repeat = true) { key(KeyCodes.FAST_FORWARD) },
+        ), 3, 8, center = true))
+        body.addView(ui.space(12))
+        body.addView(ui.grid(listOf(
+            rk("TECLADO") { showKeyboard() },
+            rk("MÁS") { showMore() },
+        ), 2, 8))
+        page.addView(body)
+        return page
+    }
+
+    // ---- Design 3: Gamepad
+    private fun gamepadPage(): View {
+        val page = pageBox()
+        fun sh(label: String, code: Int) =
+            ui.button(label, Palette.SURFACE2, heightDp = 44, sizeSp = 12f, repeat = true) { key(code) }
+        page.addView(ui.grid(listOf(
+            sh("VOL −", KeyCodes.VOLUME_DOWN), sh("VOL +", KeyCodes.VOLUME_UP),
+            sh("CH −", KeyCodes.CHANNEL_DOWN), sh("CH +", KeyCodes.CHANNEL_UP),
+        ), 4, 8))
+        page.addView(ui.space(22))
+
+        val pads = ui.horizontal()
+        pads.gravity = Gravity.CENTER
+        pads.addView(crossPad(48, circle = true))
+        pads.addView(flexGap())
+
+        fun face(letter: String, color: Int, tap: () -> Unit): View {
+            val b = ui.button(letter, color, heightDp = 48, sizeSp = 18f, onTap = tap)
+            b.background = ui.ripple(ui.oval(color))
+            b.layoutParams = LinearLayout.LayoutParams(ui.dp(48), ui.dp(48))
+            return b
+        }
+        val yMic = micButton(48, Palette.YELLOW)
+        pads.addView(grid3(arrayOf(
+            null, yMic, null,
+            face("X", Palette.BLUE) { key(KeyCodes.HOME) }, null, face("B", Palette.RED) { key(KeyCodes.BACK) },
+            null, face("A", Palette.GREEN) { key(KeyCodes.DPAD_CENTER) }, null,
+        ), 48))
+        page.addView(pads)
+
+        val legend = ui.text("A = OK · B = Atrás · X = Inicio · Y = Voz (mantén)", 12f, Palette.MUTED)
+        legend.gravity = Gravity.CENTER
+        legend.setPadding(0, ui.dp(14), 0, ui.dp(18))
+        page.addView(ui.matchWidth(legend))
+
+        page.addView(ui.grid(listOf(
+            ui.button("SELECT · Teclado", Palette.SURFACE, heightDp = 40, sizeSp = 12f) { showKeyboard() },
+            ui.button("START · Play", Palette.SURFACE, heightDp = 40, sizeSp = 12f) { key(KeyCodes.PLAY_PAUSE) },
+        ), 2, 10))
+        page.addView(ui.space(14))
+        page.addView(mediaRow())
+        page.addView(ui.space(12))
+        page.addView(ui.grid(listOf(
+            ui.button("Silencio", Palette.SURFACE, iconRes = R.drawable.ic_mute) { key(KeyCodes.MUTE) },
+            ui.button("Más", Palette.SURFACE, iconRes = R.drawable.ic_more) { showMore() },
+        ), 2))
+        return page
+    }
+
+    // ---- Design 4: One hand
+    private fun oneHandPage(): View {
+        val page = pageBox()
+        val spacer = View(this)
+        spacer.layoutParams = LinearLayout.LayoutParams(1, 0, 1f)
+        page.addView(spacer)
+        page.addView(mediaRow())
+        page.addView(ui.space(14))
+
+        val row = ui.horizontal()
+        row.gravity = Gravity.BOTTOM
+        val vol = ui.vertical()
+        vol.gravity = Gravity.CENTER_HORIZONTAL
+        vol.background = ui.rounded(Palette.SURFACE, 30)
+        vol.setPadding(ui.dp(6), ui.dp(6), ui.dp(6), ui.dp(6))
+        vol.addView(ui.button("+", Palette.SURFACE2, heightDp = 50, sizeSp = 22f, repeat = true) { key(KeyCodes.VOLUME_UP) }
+            .also { it.layoutParams = LinearLayout.LayoutParams(ui.dp(50), ui.dp(50)) })
+        val muteBox = ui.vertical()
+        muteBox.gravity = Gravity.CENTER
+        muteBox.setPadding(0, ui.dp(10), 0, ui.dp(10))
+        val mi = ui.icon(R.drawable.ic_mute, Palette.MUTED, 18)
+        mi.layoutParams = LinearLayout.LayoutParams(ui.dp(18), ui.dp(18))
+        muteBox.addView(mi)
+        volumeLabel.gravity = Gravity.CENTER
+        muteBox.addView(volumeLabel)
+        ui.press(muteBox, false, null) { key(KeyCodes.MUTE) }
+        vol.addView(muteBox)
+        vol.addView(ui.button("−", Palette.SURFACE2, heightDp = 50, sizeSp = 22f, repeat = true) { key(KeyCodes.VOLUME_DOWN) }
+            .also { it.layoutParams = LinearLayout.LayoutParams(ui.dp(50), ui.dp(50)) })
+        row.addView(vol)
+        row.addView(hGap(12))
+        val holder = FrameLayout(this)
+        holder.layoutParams = LinearLayout.LayoutParams(0, ui.dp(236), 1f)
+        navHolder = holder
+        row.addView(holder)
+        page.addView(row)
+        renderNav(228)
+
+        page.addView(ui.space(14))
+        page.addView(
+            ui.grid(
+                listOf(
+                    ui.iconButton(R.drawable.ic_more, 52) { showMore() },
+                    ui.iconButton(R.drawable.ic_keyboard, 52) { showKeyboard() },
+                    navToggleButton(52),
+                    micButton(52, Palette.ACCENT),
+                    ui.iconButton(R.drawable.ic_home, 52) { key(KeyCodes.HOME) },
+                    ui.iconButton(R.drawable.ic_back, 52) { key(KeyCodes.BACK) },
+                ), 6, 4, center = true
+            )
+        )
+        return page
+    }
+
+    // ---- shared pieces
+
+    private fun centered(v: View): View {
+        val h = LinearLayout(this)
+        h.gravity = Gravity.CENTER_HORIZONTAL
+        h.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        h.addView(v)
+        return h
+    }
+
+    /** 3×3 grid of fixed cells; null cells stay empty. */
+    private fun grid3(cells: Array<View?>, cellDp: Int): View {
+        val g = ui.vertical()
+        for (r in 0 until 3) {
+            val row = ui.horizontal()
+            for (c in 0 until 3) {
+                val holder = FrameLayout(this)
+                holder.layoutParams = LinearLayout.LayoutParams(ui.dp(cellDp + 6), ui.dp(cellDp + 6))
+                val v = cells[r * 3 + c]
+                if (v != null) {
+                    v.layoutParams = FrameLayout.LayoutParams(ui.dp(cellDp), ui.dp(cellDp), Gravity.CENTER)
+                    holder.addView(v)
+                }
+                row.addView(holder)
+            }
+            g.addView(row)
+        }
+        return g
+    }
+
+    /** Plus-shaped D-pad. */
+    private fun crossPad(cellDp: Int, circle: Boolean): View {
+        fun arrow(rot: Float, code: Int) = ui.iconButton(
+            R.drawable.ic_chevron, cellDp, Palette.SURFACE3, iconDp = (cellDp * 0.5).toInt(),
+            circle = circle, repeat = true, rotation = rot
+        ) { key(code) }
+        val ok = ui.button("OK", Palette.ACCENT, heightDp = cellDp, sizeSp = 15f) { key(KeyCodes.DPAD_CENTER) }
+        if (circle) ok.background = ui.ripple(ui.oval(Palette.ACCENT))
+        ui.press(ok, false, { longOk() }) { key(KeyCodes.DPAD_CENTER) }
+        return grid3(arrayOf(
+            null, arrow(0f, KeyCodes.DPAD_UP), null,
+            arrow(270f, KeyCodes.DPAD_LEFT), ok, arrow(90f, KeyCodes.DPAD_RIGHT),
+            null, arrow(180f, KeyCodes.DPAD_DOWN), null,
+        ), cellDp)
+    }
+
+    private fun mediaRow(): View {
+        val media = ui.horizontal()
+        media.gravity = Gravity.CENTER
+        media.background = ui.rounded(Palette.SURFACE, 30)
+        media.setPadding(ui.dp(8), ui.dp(8), ui.dp(8), ui.dp(8))
+        media.addView(ui.iconButton(R.drawable.ic_prev, 46, Palette.SURFACE) { key(KeyCodes.PREVIOUS) })
+        media.addView(flexGap())
+        media.addView(ui.iconButton(R.drawable.ic_rew, 46, Palette.SURFACE, repeat = true) { key(KeyCodes.REWIND) })
+        media.addView(flexGap())
+        media.addView(ui.iconButton(R.drawable.ic_play_pause, 56, Palette.TEXT, Palette.BG, 26) { key(KeyCodes.PLAY_PAUSE) })
+        media.addView(flexGap())
+        media.addView(ui.iconButton(R.drawable.ic_ff, 46, Palette.SURFACE, repeat = true) { key(KeyCodes.FAST_FORWARD) })
+        media.addView(flexGap())
+        media.addView(ui.iconButton(R.drawable.ic_next, 46, Palette.SURFACE) { key(KeyCodes.NEXT) })
+        return media
     }
 
     /** Horizontal [−  label  +] pill. */
@@ -314,33 +716,37 @@ class MainActivity : Activity(), RemoteClient.Listener {
         return p
     }
 
+    private var navSizeDp = 262
+
     private fun toggleTouchpad() {
         storage.touchpad = !storage.touchpad
-        (navToggle.getChildAt(0) as ImageView).setImageResource(
+        (navToggle?.getChildAt(0) as? ImageView)?.setImageResource(
             if (storage.touchpad) R.drawable.ic_dpad else R.drawable.ic_touch
         )
-        renderNav()
+        renderNav(navSizeDp)
         toast(if (storage.touchpad) "Modo touchpad: desliza para moverte, toca para OK" else "Modo flechas")
     }
 
-    private fun renderNav() {
-        navHolder.removeAllViews()
-        navHolder.addView(if (storage.touchpad) touchpad() else dpad())
+    private fun renderNav(sizeDp: Int = 262) {
+        navSizeDp = sizeDp
+        val h = navHolder ?: return
+        h.removeAllViews()
+        h.addView(if (storage.touchpad) touchpad() else dpad(sizeDp))
     }
 
-    private fun dpad(): View {
-        val size = ui.dp(262)
+    private fun dpad(sizeDp: Int): View {
+        val size = ui.dp(sizeDp)
         val ring = FrameLayout(this)
         ring.layoutParams = FrameLayout.LayoutParams(size, size, Gravity.CENTER)
         ring.background = ui.oval(Palette.SURFACE, Palette.STROKE)
-
+        val arrowDp = (sizeDp * 0.29).toInt()
         fun arrow(rot: Float, gravity: Int, code: Int): View {
             val b = ui.iconButton(
-                R.drawable.ic_chevron, 76, Palette.SURFACE, Palette.TEXT, 30,
+                R.drawable.ic_chevron, arrowDp, Palette.SURFACE, Palette.TEXT, (arrowDp * 0.4).toInt(),
                 repeat = true, rotation = rot
             ) { key(code) }
             val m = ui.dp(6)
-            b.layoutParams = FrameLayout.LayoutParams(ui.dp(76), ui.dp(76), gravity).apply { setMargins(m, m, m, m) }
+            b.layoutParams = FrameLayout.LayoutParams(ui.dp(arrowDp), ui.dp(arrowDp), gravity).apply { setMargins(m, m, m, m) }
             return b
         }
         ring.addView(arrow(0f, Gravity.TOP or Gravity.CENTER_HORIZONTAL, KeyCodes.DPAD_UP))
@@ -352,8 +758,9 @@ class MainActivity : Activity(), RemoteClient.Listener {
         val okBg = GradientDrawable(GradientDrawable.Orientation.TL_BR, intArrayOf(Palette.ACCENT, Palette.ACCENT2))
         okBg.shape = GradientDrawable.OVAL
         ok.background = ui.ripple(okBg)
-        ok.layoutParams = FrameLayout.LayoutParams(ui.dp(104), ui.dp(104), Gravity.CENTER)
-        val okText = ui.text("OK", 20f, Color.WHITE, true)
+        val okDp = (sizeDp * 0.4).toInt()
+        ok.layoutParams = FrameLayout.LayoutParams(ui.dp(okDp), ui.dp(okDp), Gravity.CENTER)
+        val okText = ui.text("OK", 20f, Palette.on(Palette.ACCENT), true)
         okText.layoutParams = FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER
         )
@@ -409,6 +816,7 @@ class MainActivity : Activity(), RemoteClient.Listener {
         pad.setOnTouchListener { v, ev ->
             when (ev.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
+                    v.parent?.requestDisallowInterceptTouchEvent(true)
                     anchorX = ev.x
                     anchorY = ev.y
                     moved = false
@@ -445,11 +853,150 @@ class MainActivity : Activity(), RemoteClient.Listener {
         return pad
     }
 
-    // ---------------------------------------------------------------- apps page
+    // ================================================================ voice
+
+    /** Hold-to-talk button: the phone becomes the TV remote's microphone. */
+    @SuppressLint("ClickableViewAccessibility")
+    private fun micButton(sizeDp: Int, bg: Int): FrameLayout {
+        val b = ui.iconButton(R.drawable.ic_mic, sizeDp, bg, Palette.on(bg), (sizeDp * 0.44).toInt()) {}
+        b.setOnClickListener(null)
+        b.setOnTouchListener { v, ev ->
+            when (ev.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    v.isPressed = true
+                    v.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                    voiceDown()
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    v.isPressed = false
+                    voiceUp()
+                }
+            }
+            true
+        }
+        return b
+    }
+
+    private fun showVoice(text: String) {
+        voiceBubbleText.text = text
+        voiceBubble.visibility = View.VISIBLE
+    }
+
+    private fun hideVoice() {
+        voiceBubble.visibility = View.GONE
+    }
+
+    private fun voiceDown() {
+        val c = client
+        if (c == null || !c.ready) {
+            notConnected(); return
+        }
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQ_MIC)
+            toast("Permite el micrófono y vuelve a mantener el botón")
+            return
+        }
+        if (!c.supportsVoice) {
+            dictate(); return
+        }
+        voicePressed = true
+        showVoice("Conectando con el TV…")
+        c.startVoice { id ->
+            main.post {
+                if (id == null) {
+                    hideVoice()
+                    // The TV did not open a voice session: use the phone's own recogniser instead.
+                    if (voicePressed) {
+                        voicePressed = false
+                        dictate()
+                    }
+                } else if (!voicePressed) {
+                    c.endVoice(id)
+                    hideVoice()
+                } else {
+                    voiceSession = id
+                    startRecorder(c, id)
+                    showVoice("Escuchando… suelta para terminar")
+                }
+            }
+        }
+    }
+
+    private fun voiceUp() {
+        voicePressed = false
+        if (voiceSession != null) {
+            voiceSession = null
+            voiceRecording = false // the recorder thread sends the rest and ends the session
+            showVoice("Enviando…")
+            main.postDelayed({ hideVoice() }, 900)
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startRecorder(c: RemoteClient, session: Int) {
+        val rate = 8000
+        val min = AudioRecord.getMinBufferSize(rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+        val rec = try {
+            AudioRecord(
+                MediaRecorder.AudioSource.VOICE_RECOGNITION, rate,
+                AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, max(min, RemoteClient.VOICE_CHUNK * 2)
+            )
+        } catch (e: Exception) {
+            c.endVoice(session)
+            hideVoice()
+            toast("No se pudo usar el micrófono")
+            return
+        }
+        if (rec.state != AudioRecord.STATE_INITIALIZED) {
+            rec.release()
+            c.endVoice(session)
+            hideVoice()
+            toast("No se pudo usar el micrófono")
+            return
+        }
+        voiceRecording = true
+        Thread({
+            val buf = ByteArray(RemoteClient.VOICE_CHUNK)
+            var filled = 0
+            try {
+                rec.startRecording()
+                while (voiceRecording) {
+                    val n = rec.read(buf, filled, buf.size - filled)
+                    if (n < 0) break
+                    filled += n
+                    if (filled == buf.size) {
+                        c.sendVoice(session, buf.copyOf())
+                        filled = 0
+                    }
+                }
+                if (filled > 0) c.sendVoice(session, buf.copyOf(filled))
+            } catch (_: Exception) {
+            } finally {
+                try { rec.stop() } catch (_: Exception) {}
+                rec.release()
+                c.endVoice(session)
+            }
+        }, "voice").start()
+    }
+
+    /** Phone speech recogniser → YouTube search. */
+    private fun dictate() {
+        val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault().toLanguageTag())
+        i.putExtra(RecognizerIntent.EXTRA_PROMPT, "¿Qué quieres ver o escuchar?")
+        try {
+            @Suppress("DEPRECATION")
+            startActivityForResult(i, REQ_SPEECH)
+        } catch (_: ActivityNotFoundException) {
+            toast("Tu teléfono no tiene reconocimiento de voz")
+        }
+    }
+
+    // ================================================================ apps page
 
     private fun appsPage(): View {
-        val page = ui.vertical()
-        page.setPadding(ui.dp(20), ui.dp(8), ui.dp(20), ui.dp(16))
+        val page = pageBox()
         page.addView(ui.text("Tus apps", 22f, Palette.TEXT, true))
         val sub = ui.text("Toca para abrirla en el TV. Mantén presionada para editar.", 13f, Palette.MUTED)
         sub.setPadding(0, ui.dp(4), 0, ui.dp(18))
@@ -459,19 +1006,19 @@ class MainActivity : Activity(), RemoteClient.Listener {
         renderApps()
 
         page.addView(ui.space(22))
-        nowPlayingCard = ui.vertical(16)
-        nowPlayingCard.background = ui.rounded(Palette.SURFACE, 22, Palette.STROKE)
+        val card = ui.vertical(16)
+        card.background = ui.rounded(Palette.SURFACE, 22, Palette.STROKE)
         val cap = ui.text("ABIERTA AHORA EN EL TV", 11f, Palette.MUTED, true)
         cap.letterSpacing = 0.08f
-        nowPlayingCard.addView(cap)
+        card.addView(cap)
         nowPlayingText = ui.text("—", 16f, Palette.TEXT, true)
         nowPlayingText.setPadding(0, ui.dp(6), 0, ui.dp(12))
-        nowPlayingCard.addView(nowPlayingText)
+        card.addView(nowPlayingText)
         nowPlayingButton = ui.button("Guardar como botón", Palette.SURFACE2, iconRes = R.drawable.ic_add) {
             addCurrentApp()
         }
-        nowPlayingCard.addView(nowPlayingButton)
-        page.addView(nowPlayingCard)
+        card.addView(nowPlayingButton)
+        page.addView(card)
         renderNowPlaying()
         return page
     }
@@ -480,7 +1027,7 @@ class MainActivity : Activity(), RemoteClient.Listener {
         appsHolder.removeAllViews()
         val views = mutableListOf<View>()
         apps.forEachIndexed { i, a ->
-            views.add(ui.appTile(a.name, a.color, { editApp(i, null) }) { link(a.link) })
+            views.add(ui.appTile(a.name, a.color, { editApp(i, null) }) { launchApp(a) })
         }
         views.add(ui.addTile("Añadir") { showAddApp() })
         appsHolder.addView(ui.grid(views, 4, 14, center = true))
@@ -494,17 +1041,72 @@ class MainActivity : Activity(), RemoteClient.Listener {
     }
 
     private fun appLabel(pkg: String): String =
-        AppCatalog.apps.firstOrNull { it.link.endsWith("id=$pkg") }?.name ?: pkg
+        AppCatalog.apps.firstOrNull { it.link.endsWith("id=$pkg") }?.name
+            ?: apps.firstOrNull { it.link.endsWith("id=$pkg") }?.name
+            ?: pkg
 
-    // ---------------------------------------------------------------- search page
+    private fun launchApp(a: AppShortcut) {
+        val c = client
+        if (c == null || !c.ready) {
+            notConnected(); return
+        }
+        if (a.route.isNotEmpty()) {
+            toast("Abriendo ${a.name}…")
+            c.key(KeyCodes.HOME)
+            a.route.forEachIndexed { i, code ->
+                main.postDelayed({ client?.key(code) }, 1600L + i * 380L)
+            }
+        } else {
+            lastLinkAt = System.currentTimeMillis()
+            c.openLink(a.link)
+        }
+    }
+
+    // ---- route recording (for apps that cannot be opened by link)
+
+    private fun startRoute(index: Int) {
+        val c = client
+        if (c == null || !c.ready) {
+            notConnected(); return
+        }
+        recordingRoute = mutableListOf()
+        routeTarget = index
+        selectTab(0)
+        c.key(KeyCodes.HOME)
+        updateRouteBanner()
+        routeBanner.visibility = View.VISIBLE
+    }
+
+    private fun updateRouteBanner() {
+        val n = recordingRoute?.size ?: 0
+        routeBannerText.text = "El TV fue a Inicio. Usa el control para llegar a la app y presiona OK sobre ella. " +
+            "Luego toca Listo. Pasos grabados: $n"
+    }
+
+    private fun finishRoute(save: Boolean) {
+        val route = recordingRoute
+        recordingRoute = null
+        routeBanner.visibility = View.GONE
+        if (!save || route == null) return
+        if (route.isEmpty()) {
+            toast("No se grabó ningún paso"); return
+        }
+        val a = apps.getOrNull(routeTarget) ?: return
+        apps[routeTarget] = a.copy(route = route.toList())
+        storage.saveApps(apps)
+        renderApps()
+        toast("Ruta guardada: ${route.size} pasos")
+    }
+
+    // ================================================================ search page
 
     private fun searchPage(): View {
-        val page = ui.vertical()
-        page.setPadding(ui.dp(20), ui.dp(8), ui.dp(20), ui.dp(16))
+        val page = pageBox()
         page.addView(ui.text("Buscar", 22f, Palette.TEXT, true))
         val sub = ui.text("Canciones, videos, series o películas.", 13f, Palette.MUTED)
         sub.setPadding(0, ui.dp(4), 0, ui.dp(16))
         page.addView(sub)
+        val row = ui.horizontal()
         searchField = ui.input("¿Qué quieres ver o escuchar?")
         searchField.imeOptions = EditorInfo.IME_ACTION_SEARCH
         searchField.setOnEditorActionListener { _, action, _ ->
@@ -512,7 +1114,11 @@ class MainActivity : Activity(), RemoteClient.Listener {
                 youtubeSearch(searchField.text.toString()); true
             } else false
         }
-        page.addView(searchField)
+        searchField.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        row.addView(searchField)
+        row.addView(hGap(10))
+        row.addView(ui.iconButton(R.drawable.ic_mic, 50, Palette.ACCENT) { dictate() })
+        page.addView(row)
         page.addView(ui.space(10))
         page.addView(
             ui.grid(
@@ -570,6 +1176,12 @@ class MainActivity : Activity(), RemoteClient.Listener {
         if (c == null || !c.ready) {
             notConnected(); return
         }
+        recordingRoute?.let {
+            if (code != KeyCodes.VOLUME_UP && code != KeyCodes.VOLUME_DOWN && code != KeyCodes.MUTE) {
+                it.add(code)
+                updateRouteBanner()
+            }
+        }
         c.key(code)
     }
 
@@ -578,6 +1190,7 @@ class MainActivity : Activity(), RemoteClient.Listener {
         if (c == null || !c.ready) {
             notConnected(); return
         }
+        lastLinkAt = System.currentTimeMillis()
         c.openLink(url)
     }
 
@@ -626,6 +1239,10 @@ class MainActivity : Activity(), RemoteClient.Listener {
 
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
 
+    private fun linkFailedHint() {
+        toast("Tu TV no dejó abrir esa app directamente. Mantén presionado su botón y usa \"Grabar ruta\".")
+    }
+
     // ================================================================ connection
 
     private fun setStatus(text: String, color: Int) {
@@ -664,6 +1281,14 @@ class MainActivity : Activity(), RemoteClient.Listener {
     override fun onDisconnected(error: String?, needsPairing: Boolean) {
         main.post {
             client = null
+            val afterLink = System.currentTimeMillis() - lastLinkAt < 5000
+            if (afterLink) {
+                // The TV drops the session when it cannot open a link: reconnect quietly.
+                lastLinkAt = 0
+                linkFailedHint()
+                device?.let { connectTo(it) }
+                return@post
+            }
             if (needsPairing) {
                 setStatus("Necesita emparejar", Palette.YELLOW)
                 device?.let { startPairing(it) }
@@ -671,8 +1296,17 @@ class MainActivity : Activity(), RemoteClient.Listener {
                 setStatus("Desconectado · toca para reconectar", Palette.RED)
                 if (autoRetry) {
                     autoRetry = false
-                    main.postDelayed({ device?.let { if (client == null) connectTo(it) } }, 2000)
+                    main.postDelayed({ device?.let { if (client == null) connectTo(it) } }, 1500)
                 }
+            }
+        }
+    }
+
+    override fun onRemoteError() {
+        main.post {
+            if (System.currentTimeMillis() - lastLinkAt < 5000) {
+                lastLinkAt = 0
+                linkFailedHint()
             }
         }
     }
@@ -695,7 +1329,68 @@ class MainActivity : Activity(), RemoteClient.Listener {
         }
     }
 
+    override fun onTextField(value: String, label: String) {
+        main.post {
+            tvFieldText = value
+            tvFieldLabel = label
+            // The TV opened its keyboard: open ours so the user can type from the phone.
+            val now = System.currentTimeMillis()
+            if (storage.autoKeyboard && resumed && keyboardSheet?.isShowing != true && now - lastAutoKeyboard > 4000) {
+                lastAutoKeyboard = now
+                showKeyboard()
+            }
+        }
+    }
+
     // ================================================================ sheets
+
+    private fun showPersonalize() {
+        ui.sheet("Personalizar", "Elige un tema de colores y un diseño para el control.") { box, d ->
+            box.addView(ui.title("Temas"))
+            val cards = Themes.all.mapIndexed { i, t -> themeCard(t, i == storage.theme) {
+                storage.theme = i
+                d.dismiss()
+                recreate()
+            } }
+            box.addView(ui.grid(cards, 2, 10))
+            box.addView(ui.title("Diseños"))
+            Designs.all.forEachIndexed { i, ds ->
+                val row = optionRow(ds.name, ds.description, if (i == storage.design) R.drawable.ic_check else R.drawable.ic_remote) {
+                    storage.design = i
+                    d.dismiss()
+                    recreate()
+                }
+                if (i == storage.design) row.background = ui.ripple(ui.rounded(Palette.SURFACE2, 18, Palette.ACCENT))
+                box.addView(row)
+            }
+        }
+    }
+
+    private fun themeCard(t: Theme, selected: Boolean, onTap: () -> Unit): View {
+        val bg = Color.parseColor(t.bg)
+        val card = ui.vertical(12)
+        val base = GradientDrawable()
+        base.setColor(bg)
+        base.cornerRadius = ui.dp(18).toFloat()
+        base.setStroke(ui.dp(if (selected) 3 else 1), if (selected) Palette.ACCENT else Palette.STROKE)
+        card.background = ui.ripple(base)
+        val preview = ui.horizontal()
+        fun dot(c: String, size: Int): View {
+            val v = View(this)
+            v.background = ui.oval(Color.parseColor(c))
+            v.layoutParams = LinearLayout.LayoutParams(ui.dp(size), ui.dp(size)).apply { rightMargin = ui.dp(6) }
+            return v
+        }
+        preview.addView(dot(t.accent, 22))
+        preview.addView(dot(t.accent2, 16))
+        preview.addView(dot(t.surface2, 16))
+        card.addView(preview)
+        val name = ui.text(t.name, 14f, Color.parseColor(t.text), true)
+        name.setPadding(0, ui.dp(10), 0, 0)
+        card.addView(name)
+        ui.press(card, false, null, onTap)
+        return card
+    }
 
     private fun showInputs() {
         ui.sheet("Fuente de entrada", "Elige a qué entrada cambiar el TV") { box, d ->
@@ -723,6 +1418,15 @@ class MainActivity : Activity(), RemoteClient.Listener {
         }
     }
 
+    private fun toggleRow(label: () -> String, icon: Int, flip: () -> Unit): View {
+        val b = ui.button(label(), Palette.SURFACE2, iconRes = icon) {}
+        ui.press(b, false, null) {
+            flip()
+            (b.getChildAt(1) as TextView).text = label()
+        }
+        return ui.matchWidth(b)
+    }
+
     private fun showMore() {
         ui.sheet("Más opciones") { box, d ->
             box.addView(
@@ -737,15 +1441,18 @@ class MainActivity : Activity(), RemoteClient.Listener {
                     ), 3
                 )
             )
+            box.addView(ui.space(10))
+            box.addView(ui.matchWidth(ui.button("Personalizar temas y diseños", Palette.ACCENT, iconRes = R.drawable.ic_palette) {
+                d.dismiss(); showPersonalize()
+            }))
             box.addView(ui.title("Configuración"))
-            fun volLabel() = if (storage.phoneVolumeKeys) "Volumen con botones del teléfono: Sí"
-            else "Volumen con botones del teléfono: No"
-            val volBtn = ui.button(volLabel(), Palette.SURFACE2, iconRes = R.drawable.ic_volume) {}
-            ui.press(volBtn, false, null) {
-                storage.phoneVolumeKeys = !storage.phoneVolumeKeys
-                (volBtn.getChildAt(1) as TextView).text = volLabel()
-            }
-            box.addView(ui.matchWidth(volBtn))
+            box.addView(toggleRow({
+                "Volumen con botones del teléfono: " + if (storage.phoneVolumeKeys) "Sí" else "No"
+            }, R.drawable.ic_volume) { storage.phoneVolumeKeys = !storage.phoneVolumeKeys })
+            box.addView(ui.space(10))
+            box.addView(toggleRow({
+                "Abrir teclado cuando el TV lo pida: " + if (storage.autoKeyboard) "Sí" else "No"
+            }, R.drawable.ic_keyboard) { storage.autoKeyboard = !storage.autoKeyboard })
             box.addView(ui.space(10))
             box.addView(ui.matchWidth(ui.button("Cambiar de televisor", Palette.SURFACE2, iconRes = R.drawable.ic_tv) {
                 d.dismiss(); showDevicePicker()
@@ -770,39 +1477,25 @@ class MainActivity : Activity(), RemoteClient.Listener {
     }
 
     private fun showKeyboard() {
-        val dlg = ui.sheet(
-            "Teclado",
-            "Lo que escribas aparece en el TV al instante. Primero selecciona un campo de texto en el TV."
-        ) { box, _ ->
+        keyboardSheet?.let { if (it.isShowing) return }
+        val subtitle = buildString {
+            append("Escribe y toca Enviar: el texto aparece en el campo seleccionado del TV.")
+            if (tvFieldLabel.isNotBlank()) append("\nCampo del TV: ").append(tvFieldLabel)
+            if (tvFieldText.isNotBlank()) append("\nTexto actual en el TV: ").append(tvFieldText)
+        }
+        val dlg = ui.sheet("Teclado", subtitle) { box, sheet ->
             val field = ui.input("Escribe aquí…")
-            field.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS or
-                InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
-            field.imeOptions = EditorInfo.IME_ACTION_DONE
-            field.addTextChangedListener(object : TextWatcher {
-                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
-                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
-                    val c = client
-                    if (c == null || !c.ready || s == null) return
-                    repeat(before) { c.key(KeyCodes.DEL) }
-                    if (count > 0) {
-                        val added = s.subSequence(start, start + count).toString()
-                        for (ch in added) {
-                            val k = KeyCodes.forChar(ch) ?: continue
-                            if (k.second) {
-                                c.key(KeyCodes.SHIFT_LEFT, RemoteClient.START_LONG)
-                                c.key(k.first)
-                                c.key(KeyCodes.SHIFT_LEFT, RemoteClient.END_LONG)
-                            } else {
-                                c.key(k.first)
-                            }
-                        }
-                    }
-                }
-                override fun afterTextChanged(s: Editable?) {}
-            })
+            field.imeOptions = EditorInfo.IME_ACTION_SEND
+            fun send(enter: Boolean) {
+                val t = field.text.toString()
+                if (t.isNotEmpty()) sendText(t)
+                if (enter) main.postDelayed({ key(KeyCodes.ENTER) }, 350)
+                field.setText("")
+                if (enter) sheet.dismiss()
+            }
             field.setOnEditorActionListener { _, action, _ ->
-                if (action == EditorInfo.IME_ACTION_DONE) {
-                    key(KeyCodes.ENTER); true
+                if (action == EditorInfo.IME_ACTION_SEND) {
+                    send(true); true
                 } else false
             }
             box.addView(field)
@@ -811,8 +1504,9 @@ class MainActivity : Activity(), RemoteClient.Listener {
                 ui.grid(
                     listOf(
                         ui.button("Borrar", iconRes = R.drawable.ic_backspace, repeat = true) { key(KeyCodes.DEL) },
-                        ui.button("Enter", Palette.ACCENT) { key(KeyCodes.ENTER) },
-                    ), 2
+                        ui.button("Enviar") { send(false) },
+                        ui.button("Enviar y buscar", Palette.ACCENT, sizeSp = 13f) { send(true) },
+                    ), 3
                 )
             )
             field.requestFocus()
@@ -820,15 +1514,16 @@ class MainActivity : Activity(), RemoteClient.Listener {
         dlg.window?.setSoftInputMode(
             WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE or WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
         )
+        keyboardSheet = dlg
     }
 
     private fun showDevicePicker() {
         val found = mutableListOf<TvDevice>()
         var listRef: LinearLayout? = null
         var emptyRef: TextView? = null
-        var sheetRef: android.app.Dialog? = null
+        var sheetRef: Dialog? = null
 
-        val realDiscovery = Discovery(this) { tv ->
+        val discovery = Discovery(this) { tv ->
             main.post {
                 val list = listRef ?: return@post
                 if (found.none { it.host == tv.host }) {
@@ -875,8 +1570,8 @@ class MainActivity : Activity(), RemoteClient.Listener {
             }))
         }
         sheetRef = sheet
-        sheet.setOnDismissListener { realDiscovery.stop() }
-        realDiscovery.start()
+        sheet.setOnDismissListener { discovery.stop() }
+        discovery.start()
     }
 
     private fun startPairing(d: TvDevice) {
@@ -898,7 +1593,7 @@ class MainActivity : Activity(), RemoteClient.Listener {
 
     private fun askCode(d: TvDevice, pairing: Pairing) {
         var finished = false
-        var sheetRef: android.app.Dialog? = null
+        var sheetRef: Dialog? = null
         val sheet = ui.sheet(
             "Emparejar con ${d.name}",
             "Escribe el código de 6 caracteres que aparece en tu televisor."
@@ -1010,7 +1705,7 @@ class MainActivity : Activity(), RemoteClient.Listener {
             }
             box.addView(ui.grid(tiles, 4, 14, center = true))
             val note = ui.text(
-                "Si alguna no abre en tu TV, abre la app en el TV y usa \"La app abierta ahora en el TV\".",
+                "Si alguna no abre en tu TV, mantén presionado su botón y usa \"Grabar ruta\".",
                 12f, Palette.MUTED
             )
             note.setPadding(ui.dp(2), ui.dp(16), 0, 0)
@@ -1026,7 +1721,7 @@ class MainActivity : Activity(), RemoteClient.Listener {
         val known = AppCatalog.apps.firstOrNull { it.link.endsWith("id=$pkg") }
         val name = known?.name ?: pkg.substringAfterLast('.').replaceFirstChar { it.uppercase() }
         val color = known?.color ?: Palette.CHIPS[apps.size % Palette.CHIPS.size]
-        editApp(-1, AppShortcut(name, AppCatalog.pkg(pkg), color))
+        editApp(-1, AppShortcut(name, known?.link ?: AppCatalog.pkg(pkg), color))
     }
 
     private fun label(s: String, topDp: Int): TextView {
@@ -1050,6 +1745,34 @@ class MainActivity : Activity(), RemoteClient.Listener {
             var color = existing?.color ?: Palette.CHIPS[apps.size % Palette.CHIPS.size]
             box.addView(label("Color", 14))
             box.addView(colorPicker(color) { color = it })
+
+            if (index >= 0) {
+                box.addView(ui.title("¿No abre en tu TV?"))
+                val routeInfo = existing?.route?.size ?: 0
+                val info = ui.text(
+                    if (routeInfo > 0) "Ruta grabada: $routeInfo pasos. El botón usa la ruta en vez del enlace."
+                    else "Graba el camino desde Inicio hasta la app y el botón lo repetirá por ti.",
+                    12f, Palette.MUTED
+                )
+                info.setPadding(ui.dp(2), 0, 0, ui.dp(8))
+                box.addView(info)
+                val routeButtons = mutableListOf<View>(
+                    ui.button("Grabar ruta", Palette.SURFACE2, iconRes = R.drawable.ic_record) {
+                        d.dismiss(); startRoute(index)
+                    }
+                )
+                if (routeInfo > 0) {
+                    routeButtons.add(ui.button("Quitar ruta", Palette.SURFACE2) {
+                        val a = apps[index]
+                        apps[index] = a.copy(route = emptyList())
+                        storage.saveApps(apps)
+                        renderApps()
+                        d.dismiss()
+                    })
+                }
+                box.addView(ui.grid(routeButtons, routeButtons.size))
+            }
+
             box.addView(ui.space(18))
             val actions = mutableListOf<View>()
             if (index >= 0) {
@@ -1067,7 +1790,8 @@ class MainActivity : Activity(), RemoteClient.Listener {
                     toast("Escribe el nombre y el paquete o enlace")
                 } else {
                     val l = if (raw.contains(":")) raw else AppCatalog.pkg(raw)
-                    val a = AppShortcut(nm, l, color)
+                    val keepRoute = existing?.route ?: emptyList()
+                    val a = AppShortcut(nm, l, color, if (index >= 0) keepRoute else emptyList())
                     if (index >= 0) apps[index] = a else apps.add(a)
                     storage.saveApps(apps)
                     renderApps()
