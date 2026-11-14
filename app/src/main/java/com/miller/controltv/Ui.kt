@@ -1,10 +1,12 @@
 package com.miller.controltv
 
 import android.annotation.SuppressLint
-import android.content.Context
+import android.app.Activity
+import android.app.Dialog
 import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
 import android.os.Handler
@@ -16,139 +18,126 @@ import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.Window
+import android.view.WindowManager
 import android.widget.EditText
+import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 
 object Palette {
-    val BG = Color.parseColor("#0F1115")
-    val CARD = Color.parseColor("#181C24")
-    val KEY = Color.parseColor("#232935")
-    val KEY_STRONG = Color.parseColor("#2E3646")
-    val TEXT = Color.parseColor("#EEF1F6")
-    val MUTED = Color.parseColor("#8A93A6")
-    val ACCENT = Color.parseColor("#4F8CFF")
-    val RED = Color.parseColor("#E5484D")
+    val BG = Color.parseColor("#0B0D12")
+    val SURFACE = Color.parseColor("#14171F")
+    val SURFACE2 = Color.parseColor("#1C2029")
+    val SURFACE3 = Color.parseColor("#262B36")
+    val STROKE = Color.parseColor("#2A2F3A")
+    val TEXT = Color.parseColor("#F2F4F8")
+    val MUTED = Color.parseColor("#8B93A5")
+    val ACCENT = Color.parseColor("#7C8CFF")
+    val ACCENT2 = Color.parseColor("#B07CFF")
+    val RED = Color.parseColor("#FF5C67")
     val GREEN = Color.parseColor("#3DD68C")
     val YELLOW = Color.parseColor("#F5C451")
-    val YOUTUBE = Color.parseColor("#FF0033")
-    val NETFLIX = Color.parseColor("#B20710")
-    val SPOTIFY = Color.parseColor("#1DB954")
-    val PRIME = Color.parseColor("#00A8E1")
-    val DISNEY = Color.parseColor("#1A3D8F")
     val CHIPS = intArrayOf(
-        Color.parseColor("#4F8CFF"), Color.parseColor("#8E4EC6"), Color.parseColor("#12A594"),
-        Color.parseColor("#E5484D"), Color.parseColor("#F76B15"), Color.parseColor("#3E63DD")
+        Color.parseColor("#7C8CFF"), Color.parseColor("#B07CFF"), Color.parseColor("#12A594"),
+        Color.parseColor("#FF5C67"), Color.parseColor("#F76B15"), Color.parseColor("#3E63DD"),
+        Color.parseColor("#E5A00D"), Color.parseColor("#1DB954")
     )
 }
 
-class Ui(private val ctx: Context) {
+class Ui(private val act: Activity) {
     private val handler = Handler(Looper.getMainLooper())
+    val medium: Typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
 
     fun dp(v: Int): Int = TypedValue.applyDimension(
-        TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), ctx.resources.displayMetrics
+        TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), act.resources.displayMetrics
     ).toInt()
 
-    fun rounded(color: Int, radiusDp: Int = 16): GradientDrawable = GradientDrawable().apply {
-        setColor(color)
-        cornerRadius = dp(radiusDp).toFloat()
-    }
+    fun rounded(color: Int, radiusDp: Int = 16, stroke: Int? = null): GradientDrawable =
+        GradientDrawable().apply {
+            setColor(color)
+            cornerRadius = dp(radiusDp).toFloat()
+            if (stroke != null) setStroke(dp(1), stroke)
+        }
 
-    fun oval(color: Int): GradientDrawable = GradientDrawable().apply {
+    fun gradient(a: Int, b: Int, radiusDp: Int): GradientDrawable =
+        GradientDrawable(GradientDrawable.Orientation.TL_BR, intArrayOf(a, b)).apply {
+            cornerRadius = dp(radiusDp).toFloat()
+        }
+
+    fun oval(color: Int, stroke: Int? = null): GradientDrawable = GradientDrawable().apply {
         shape = GradientDrawable.OVAL
         setColor(color)
+        if (stroke != null) setStroke(dp(1), stroke)
     }
 
     fun ripple(base: GradientDrawable) =
-        RippleDrawable(ColorStateList.valueOf(Color.argb(60, 255, 255, 255)), base, null)
+        RippleDrawable(ColorStateList.valueOf(Color.argb(50, 255, 255, 255)), base, null)
 
-    fun vertical(paddingDp: Int = 0): LinearLayout = LinearLayout(ctx).apply {
+    fun vertical(paddingDp: Int = 0): LinearLayout = LinearLayout(act).apply {
         orientation = LinearLayout.VERTICAL
         setPadding(dp(paddingDp), dp(paddingDp), dp(paddingDp), dp(paddingDp))
     }
 
-    fun horizontal(): LinearLayout = LinearLayout(ctx).apply {
+    fun horizontal(): LinearLayout = LinearLayout(act).apply {
         orientation = LinearLayout.HORIZONTAL
         gravity = Gravity.CENTER_VERTICAL
     }
 
     fun text(s: String, sizeSp: Float = 14f, color: Int = Palette.TEXT, bold: Boolean = false) =
-        TextView(ctx).apply {
+        TextView(act).apply {
             text = s
             setTextColor(color)
             textSize = sizeSp
-            if (bold) typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            if (bold) typeface = medium
         }
 
-    fun section(title: String): TextView = text(title.uppercase(), 12f, Palette.MUTED, true).apply {
-        letterSpacing = 0.08f
-        layoutParams = LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { setMargins(dp(4), dp(18), 0, dp(8)) }
+    fun title(s: String): TextView = text(s, 13f, Palette.MUTED, true).apply {
+        letterSpacing = 0.04f
+        setPadding(dp(4), dp(18), dp(4), dp(10))
     }
 
-    fun card(): LinearLayout = vertical(12).apply {
-        background = rounded(Palette.CARD, 22)
-        layoutParams = LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
-        )
+    fun icon(res: Int, tint: Int = Palette.TEXT, sizeDp: Int = 24): ImageView = ImageView(act).apply {
+        setImageResource(res)
+        imageTintList = ColorStateList.valueOf(tint)
+        layoutParams = FrameLayout.LayoutParams(dp(sizeDp), dp(sizeDp), Gravity.CENTER)
     }
 
-    fun input(hint: String): EditText = EditText(ctx).apply {
+    fun input(hint: String): EditText = EditText(act).apply {
         this.hint = hint
         setHintTextColor(Palette.MUTED)
         setTextColor(Palette.TEXT)
         textSize = 15f
         isSingleLine = true
         inputType = InputType.TYPE_CLASS_TEXT
-        background = rounded(Palette.KEY, 14)
-        setPadding(dp(14), dp(12), dp(14), dp(12))
+        background = rounded(Palette.SURFACE2, 16, Palette.STROKE)
+        setPadding(dp(16), dp(14), dp(16), dp(14))
     }
 
-    /**
-     * A remote key. When [repeat] is true, holding it down keeps sending.
-     */
+    /** Attaches tap / hold-to-repeat / long-press behaviour with haptics. */
     @SuppressLint("ClickableViewAccessibility")
-    fun key(
-        label: String,
-        color: Int = Palette.KEY,
-        textColor: Int = Palette.TEXT,
-        sizeSp: Float = 15f,
-        heightDp: Int = 52,
-        circle: Boolean = false,
-        repeat: Boolean = false,
-        onLongPress: (() -> Unit)? = null,
-        onTap: () -> Unit
-    ): TextView {
-        val v = TextView(ctx).apply {
-            text = label
-            setTextColor(textColor)
-            textSize = sizeSp
-            gravity = Gravity.CENTER
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-            maxLines = 2
-            background = ripple(if (circle) oval(color) else rounded(color, 16))
-            isClickable = true
-            isFocusable = true
-            minHeight = dp(heightDp)
-            setPadding(dp(6), dp(4), dp(6), dp(4))
-        }
+    fun press(v: View, repeat: Boolean, onLongPress: (() -> Unit)?, onTap: () -> Unit) {
+        v.isClickable = true
+        v.isFocusable = true
         if (repeat) {
             var repeating: Runnable? = null
             v.setOnTouchListener { view, ev ->
-                when (ev.action) {
+                when (ev.actionMasked) {
                     MotionEvent.ACTION_DOWN -> {
                         view.isPressed = true
                         view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
                         onTap()
                         val r = object : Runnable {
                             override fun run() {
+                                view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
                                 onTap()
-                                handler.postDelayed(this, 130)
+                                handler.postDelayed(this, 120)
                             }
                         }
                         repeating = r
-                        handler.postDelayed(r, 450)
+                        handler.postDelayed(r, 420)
                     }
                     MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                         view.isPressed = false
@@ -164,14 +153,123 @@ class Ui(private val ctx: Context) {
                 onTap()
             }
             if (onLongPress != null) {
-                v.setOnLongClickListener { onLongPress(); true }
+                v.setOnLongClickListener {
+                    it.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                    onLongPress(); true
+                }
             }
         }
-        return v
     }
 
-    /** Lays out views in rows of [columns] equal-width cells. */
-    fun grid(views: List<View>, columns: Int, gapDp: Int = 8): LinearLayout {
+    /** Round (or rounded-square) button with an icon. */
+    fun iconButton(
+        res: Int,
+        sizeDp: Int = 56,
+        bg: Int = Palette.SURFACE2,
+        tint: Int = Palette.TEXT,
+        iconDp: Int = 24,
+        circle: Boolean = true,
+        repeat: Boolean = false,
+        rotation: Float = 0f,
+        onLongPress: (() -> Unit)? = null,
+        onTap: () -> Unit
+    ): FrameLayout {
+        val f = FrameLayout(act)
+        f.background = ripple(if (circle) oval(bg) else rounded(bg, 18))
+        f.layoutParams = LinearLayout.LayoutParams(dp(sizeDp), dp(sizeDp))
+        val i = icon(res, tint, iconDp)
+        i.rotation = rotation
+        f.addView(i)
+        press(f, repeat, onLongPress, onTap)
+        return f
+    }
+
+    /** Text button (pill or rounded rect). */
+    fun button(
+        label: String,
+        bg: Int = Palette.SURFACE2,
+        textColor: Int = Palette.TEXT,
+        heightDp: Int = 50,
+        sizeSp: Float = 14f,
+        iconRes: Int? = null,
+        repeat: Boolean = false,
+        onLongPress: (() -> Unit)? = null,
+        onTap: () -> Unit
+    ): LinearLayout {
+        val b = horizontal()
+        b.gravity = Gravity.CENTER
+        b.minimumHeight = dp(heightDp)
+        b.setPadding(dp(12), dp(6), dp(12), dp(6))
+        b.background = ripple(rounded(bg, 16))
+        if (iconRes != null) {
+            val i = icon(iconRes, textColor, 18)
+            i.layoutParams = LinearLayout.LayoutParams(dp(18), dp(18)).apply { rightMargin = dp(8) }
+            b.addView(i)
+        }
+        b.addView(text(label, sizeSp, textColor, true).apply { maxLines = 2; gravity = Gravity.CENTER })
+        press(b, repeat, onLongPress, onTap)
+        return b
+    }
+
+    /** App tile: coloured square with the initial and the name under it. */
+    fun appTile(name: String, color: Int, onLongPress: (() -> Unit)?, onTap: () -> Unit): LinearLayout {
+        val col = vertical()
+        col.gravity = Gravity.CENTER_HORIZONTAL
+        val sq = FrameLayout(act)
+        sq.background = ripple(gradient(color, darken(color), 22))
+        sq.layoutParams = LinearLayout.LayoutParams(dp(68), dp(68))
+        sq.addView(text(initials(name), 22f, Color.WHITE, true).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER
+            )
+        })
+        press(sq, false, onLongPress, onTap)
+        col.addView(sq)
+        col.addView(text(name, 12f, Palette.TEXT).apply {
+            gravity = Gravity.CENTER
+            maxLines = 1
+            setPadding(0, dp(6), 0, 0)
+        })
+        return col
+    }
+
+    fun addTile(label: String, onTap: () -> Unit): LinearLayout {
+        val col = vertical()
+        col.gravity = Gravity.CENTER_HORIZONTAL
+        val sq = FrameLayout(act)
+        val base = rounded(Palette.SURFACE, 22)
+        base.setStroke(dp(1), Palette.STROKE)
+        sq.background = ripple(base)
+        sq.layoutParams = LinearLayout.LayoutParams(dp(68), dp(68))
+        sq.addView(icon(R.drawable.ic_add, Palette.MUTED, 28))
+        press(sq, false, null, onTap)
+        col.addView(sq)
+        col.addView(text(label, 12f, Palette.MUTED).apply { gravity = Gravity.CENTER; setPadding(0, dp(6), 0, 0) })
+        return col
+    }
+
+    fun chip(label: String, color: Int = Palette.SURFACE2, textColor: Int = Palette.TEXT,
+             onLongPress: (() -> Unit)? = null, onTap: () -> Unit): TextView =
+        text(label, 13f, textColor, true).apply {
+            background = ripple(rounded(color, 40))
+            setPadding(dp(14), dp(9), dp(14), dp(9))
+            press(this, false, onLongPress, onTap)
+        }
+
+    fun darken(c: Int, f: Float = 0.72f): Int =
+        Color.rgb((Color.red(c) * f).toInt(), (Color.green(c) * f).toInt(), (Color.blue(c) * f).toInt())
+
+    private fun initials(name: String): String {
+        val parts = name.trim().split(" ", "-", ".").filter { it.isNotEmpty() }
+        return when {
+            parts.isEmpty() -> "?"
+            parts.size == 1 -> parts[0].take(2).replaceFirstChar { it.uppercase() }
+            else -> (parts[0].take(1) + parts[1].take(1)).uppercase()
+        }
+    }
+
+    /** Equal-width rows of [columns] cells. */
+    fun grid(views: List<View>, columns: Int, gapDp: Int = 10, center: Boolean = false): LinearLayout {
         val root = vertical()
         views.chunked(columns).forEachIndexed { rowIndex, rowViews ->
             val row = horizontal()
@@ -179,17 +277,96 @@ class Ui(private val ctx: Context) {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
             ).apply { if (rowIndex > 0) topMargin = dp(gapDp) }
             for (i in 0 until columns) {
-                val cell: View = rowViews.getOrNull(i) ?: View(ctx)
-                cell.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-                    .apply { if (i > 0) leftMargin = dp(gapDp) }
-                row.addView(cell)
+                val cell: View = rowViews.getOrNull(i) ?: View(act)
+                if (center) {
+                    val holder = LinearLayout(act).apply { gravity = Gravity.CENTER_HORIZONTAL }
+                    holder.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                        .apply { if (i > 0) leftMargin = dp(gapDp) }
+                    holder.addView(cell)
+                    row.addView(holder)
+                } else {
+                    cell.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                        .apply { if (i > 0) leftMargin = dp(gapDp) }
+                    row.addView(cell)
+                }
             }
             root.addView(row)
         }
         return root
     }
 
-    fun space(heightDp: Int): View = View(ctx).apply {
+    /** Wrapping row of chips. */
+    fun flow(views: List<View>): LinearLayout {
+        // Simple flow: rows of up to 3 chips, left aligned.
+        val root = vertical()
+        views.chunked(3).forEachIndexed { idx, rowViews ->
+            val row = horizontal()
+            row.layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { if (idx > 0) topMargin = dp(8) }
+            rowViews.forEachIndexed { i, v ->
+                v.layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { if (i > 0) leftMargin = dp(8) }
+                row.addView(v)
+            }
+            root.addView(row)
+        }
+        return root
+    }
+
+    fun space(heightDp: Int): View = View(act).apply {
         layoutParams = LinearLayout.LayoutParams(1, dp(heightDp))
+    }
+
+    fun matchWidth(v: View): View {
+        v.layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        return v
+    }
+
+    /** Bottom sheet that slides up from the bottom of the screen. */
+    fun sheet(titleText: String, subtitle: String? = null, build: (LinearLayout, Dialog) -> Unit): Dialog {
+        val d = Dialog(act)
+        d.requestWindowFeature(Window.FEATURE_NO_TITLE)
+        val box = vertical()
+        box.setPadding(dp(20), dp(10), dp(20), dp(24))
+        box.background = GradientDrawable().apply {
+            setColor(Palette.SURFACE)
+            val r = dp(28).toFloat()
+            cornerRadii = floatArrayOf(r, r, r, r, 0f, 0f, 0f, 0f)
+        }
+        // grabber
+        val grab = View(act).apply {
+            background = rounded(Palette.SURFACE3, 4)
+            layoutParams = LinearLayout.LayoutParams(dp(40), dp(5)).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+                bottomMargin = dp(14)
+            }
+        }
+        box.addView(grab)
+        box.addView(text(titleText, 20f, Palette.TEXT, true))
+        if (subtitle != null) {
+            box.addView(text(subtitle, 13f, Palette.MUTED).apply { setPadding(0, dp(4), 0, 0) })
+        }
+        box.addView(space(16))
+        build(box, d)
+        val scroll = ScrollView(act).apply {
+            isFillViewport = false
+            addView(box)
+        }
+        d.setContentView(scroll)
+        d.window?.let { w ->
+            w.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+            w.setGravity(Gravity.BOTTOM)
+            w.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            w.setWindowAnimations(android.R.style.Animation_InputMethod)
+            w.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+            w.setDimAmount(0.55f)
+            w.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+        }
+        d.show()
+        return d
     }
 }

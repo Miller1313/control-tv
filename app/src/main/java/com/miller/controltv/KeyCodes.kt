@@ -38,6 +38,8 @@ object KeyCodes {
     const val COMPOSITE_1 = 247
     const val COMPONENT_1 = 249
     const val ASSIST = 219
+    const val INFO = 165
+    const val LAST_CHANNEL = 229
 
     /** Named keys a custom button can use. */
     val named: List<Pair<String, Int>> = listOf(
@@ -48,7 +50,7 @@ object KeyCodes {
         "Anterior" to PREVIOUS, "Retroceder" to REWIND, "Adelantar" to FAST_FORWARD,
         "Canal +" to CHANNEL_UP, "Canal −" to CHANNEL_DOWN, "Guía" to GUIDE,
         "Ajustes" to SETTINGS, "Menú de entradas" to TV_INPUT, "Subtítulos" to CAPTIONS,
-        "Asistente" to ASSIST, "Buscar" to SEARCH, "HDMI 1" to HDMI_1, "HDMI 2" to HDMI_2,
+        "Asistente" to ASSIST, "Info" to INFO, "Canal anterior" to LAST_CHANNEL, "Buscar" to SEARCH, "HDMI 1" to HDMI_1, "HDMI 2" to HDMI_2,
         "HDMI 3" to HDMI_3, "HDMI 4" to HDMI_4, "AV" to COMPOSITE_1,
         "Antena/Cable" to ANTENNA_CABLE, "Componente" to COMPONENT_1, "Enter" to ENTER,
         "Borrar" to DEL
